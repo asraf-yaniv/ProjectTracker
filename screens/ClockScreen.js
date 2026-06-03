@@ -1,23 +1,55 @@
-import React, { useState, useEffect } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, Alert, FlatList, ScrollView } from 'react-native';
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  View, Text, TouchableOpacity, StyleSheet,
+  Alert, FlatList, ScrollView, ActivityIndicator
+} from 'react-native';
 import { supabase } from '../supabase';
+import { useAuth } from '../context/AuthContext';
 
 export default function ClockScreen() {
+  const { profile } = useAuth();
+  const isWorker = profile?.role === 'worker';
+
+  // Selection state
   const [projects, setProjects] = useState([]);
   const [buildings, setBuildings] = useState([]);
   const [tasks, setTasks] = useState([]);
-
   const [selectedProject, setSelectedProject] = useState(null);
   const [selectedBuilding, setSelectedBuilding] = useState(null);
   const [selectedTask, setSelectedTask] = useState(null);
 
+  // Clock state
   const [isClockedIn, setIsClockedIn] = useState(false);
   const [currentEventId, setCurrentEventId] = useState(null);
+
+  // UI state
   const [loading, setLoading] = useState(false);
+  const [initializing, setInitializing] = useState(true);
 
   useEffect(() => {
-    fetchProjects();
+    const initialize = async () => {
+      await Promise.all([fetchProjects(), checkExistingClockIn()]);
+      setInitializing(false);
+    };
+    initialize();
   }, []);
+
+  // Check if the user already has an active clock event from a previous session
+  const checkExistingClockIn = async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+
+    const { data } = await supabase
+      .from('clock_events')
+      .select('id, project_id, building_id, task_assignment_id')
+      .eq('user_id', user.id)
+      .is('clock_out', null)
+      .maybeSingle(); // Use maybeSingle to avoid error when no row exists
+
+    if (data) {
+      setIsClockedIn(true);
+      setCurrentEventId(data.id);
+    }
+  };
 
   // Fetch all active projects
   const fetchProjects = async () => {
@@ -47,27 +79,46 @@ export default function ClockScreen() {
     }
   };
 
-  // Fetch tasks for the selected project and optionally building
+  // Fetch tasks — workers see their assignments, others see all tasks
   const fetchTasks = async (projectId, buildingId = null) => {
-    let query = supabase
-      .from('tasks')
-      .select('id, name, estimated_hours')
-      .eq('project_id', projectId);
+    if (isWorker) {
+      const { data, error } = await supabase
+        .from('task_assignments')
+        .select('id, tasks(id, name, estimated_hours, quantity)')
+        .eq('project_id', projectId)
+        .eq('user_id', profile.id);
 
-    if (buildingId) {
-      query = query.eq('building_id', buildingId);
-    }
-
-    const { data, error } = await query;
-
-    if (error) {
-      console.error('Error fetching tasks:', error.message);
+      if (error) {
+        console.error('Error fetching assigned tasks:', error.message);
+      } else {
+        setTasks(data.map(a => ({
+          id: a.id,
+          name: a.tasks?.name,
+          estimated_hours: a.tasks?.estimated_hours,
+          isAssignment: true,
+        })));
+      }
     } else {
-      setTasks(data);
+      let query = supabase
+        .from('tasks')
+        .select('id, name, estimated_hours')
+        .eq('project_id', projectId);
+
+      if (buildingId) {
+        query = query.eq('building_id', buildingId);
+      }
+
+      const { data, error } = await query;
+
+      if (error) {
+        console.error('Error fetching tasks:', error.message);
+      } else {
+        setTasks(data);
+      }
     }
   };
 
-  // Called when worker selects a project
+  // Reset building and task selection when project changes
   const handleSelectProject = (project) => {
     setSelectedProject(project);
     setSelectedBuilding(null);
@@ -82,14 +133,14 @@ export default function ClockScreen() {
     }
   };
 
-  // Called when worker selects a building
+  // Reset task selection when building changes
   const handleSelectBuilding = (building) => {
     setSelectedBuilding(building);
     setSelectedTask(null);
     fetchTasks(selectedProject.id, building.id);
   };
 
-  // Records clock in to the database
+  // Clock in — saves event to database
   const handleClockIn = async () => {
     if (!selectedTask) {
       Alert.alert('Error', 'Please select a task first.');
@@ -106,6 +157,7 @@ export default function ClockScreen() {
         user_id: user.id,
         project_id: selectedProject.id,
         building_id: selectedBuilding?.id || null,
+        task_assignment_id: selectedTask.isAssignment ? selectedTask.id : null,
         clock_in: new Date().toISOString(),
       })
       .select()
@@ -122,7 +174,7 @@ export default function ClockScreen() {
     setLoading(false);
   };
 
-  // Records clock out time
+  // Clock out — updates existing event with clock_out time
   const handleClockOut = async () => {
     setLoading(true);
 
@@ -147,7 +199,12 @@ export default function ClockScreen() {
     setLoading(false);
   };
 
-  // Reusable selection list renderer
+  // Sign out the current user
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+  };
+
+  // Reusable horizontal chip selection list
   const renderSelectionList = (data, selected, onSelect, label) => (
     <>
       <Text style={styles.label}>{label}</Text>
@@ -155,6 +212,7 @@ export default function ClockScreen() {
         data={data}
         keyExtractor={(item) => item.id}
         horizontal
+        showsHorizontalScrollIndicator={false}
         renderItem={({ item }) => (
           <TouchableOpacity
             style={[styles.chip, selected?.id === item.id && styles.chipSelected]}
@@ -170,33 +228,44 @@ export default function ClockScreen() {
     </>
   );
 
+  // Show spinner while initializing
+  if (initializing) {
+    return (
+      <View style={styles.centered}>
+        <ActivityIndicator size="large" color="#2563eb" />
+      </View>
+    );
+  }
+
   return (
-    <ScrollView style={styles.container}>
+    <ScrollView style={styles.container} contentContainerStyle={styles.contentContainer}>
       <Text style={styles.title}>Clock In / Out</Text>
 
-      {/* Only show selection when not clocked in */}
+      {/* Selection section — hidden when clocked in */}
       {!isClockedIn && (
         <>
-          {/* Project selection */}
           {renderSelectionList(projects, selectedProject, handleSelectProject, 'Select Project:')}
 
-          {/* Building selection — only shown if project has buildings */}
           {selectedProject?.has_buildings && buildings.length > 0 &&
             renderSelectionList(buildings, selectedBuilding, handleSelectBuilding, 'Select Building:')}
 
-          {/* Task selection */}
           {tasks.length > 0 &&
-            renderSelectionList(tasks, selectedTask, setSelectedTask, 'Select Task:')}
+            renderSelectionList(tasks, selectedTask, (item) => setSelectedTask(item), 'Select Task:')}
         </>
       )}
 
-      {/* Summary when clocked in */}
+      {/* Active session summary */}
       {isClockedIn && (
         <View style={styles.summaryCard}>
           <Text style={styles.summaryTitle}>Currently Working On:</Text>
-          <Text style={styles.summaryText}>Project: {selectedProject?.name}</Text>
-          {selectedBuilding && <Text style={styles.summaryText}>Building: {selectedBuilding?.name}</Text>}
-          <Text style={styles.summaryText}>Task: {selectedTask?.name}</Text>
+          {selectedProject
+            ? <>
+                <Text style={styles.summaryText}>Project: {selectedProject.name}</Text>
+                {selectedBuilding && <Text style={styles.summaryText}>Building: {selectedBuilding.name}</Text>}
+                {selectedTask && <Text style={styles.summaryText}>Task: {selectedTask.name}</Text>}
+              </>
+            : <Text style={styles.summaryText}>Session active — restored from previous login.</Text>
+          }
         </View>
       )}
 
@@ -206,9 +275,15 @@ export default function ClockScreen() {
         onPress={isClockedIn ? handleClockOut : handleClockIn}
         disabled={loading}
       >
-        <Text style={styles.buttonText}>
-          {loading ? 'Please wait...' : isClockedIn ? 'Clock Out' : 'Clock In'}
-        </Text>
+        {loading
+          ? <ActivityIndicator color="#fff" />
+          : <Text style={styles.buttonText}>{isClockedIn ? 'Clock Out' : 'Clock In'}</Text>
+        }
+      </TouchableOpacity>
+
+      {/* Logout button */}
+      <TouchableOpacity style={styles.logoutButton} onPress={handleLogout}>
+        <Text style={styles.logoutText}>Logout</Text>
       </TouchableOpacity>
     </ScrollView>
   );
@@ -217,8 +292,16 @@ export default function ClockScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    padding: 16,
     backgroundColor: '#f5f5f5',
+  },
+  contentContainer: {
+    padding: 16,
+    paddingBottom: 32,
+  },
+  centered: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   title: {
     fontSize: 24,
@@ -279,8 +362,7 @@ const styles = StyleSheet.create({
     padding: 18,
     borderRadius: 8,
     alignItems: 'center',
-    marginTop: 8,
-    marginBottom: 32,
+    marginBottom: 12,
   },
   clockInButton: {
     backgroundColor: '#16a34a',
@@ -291,6 +373,18 @@ const styles = StyleSheet.create({
   buttonText: {
     color: '#fff',
     fontSize: 18,
+    fontWeight: 'bold',
+  },
+  logoutButton: {
+    padding: 14,
+    borderRadius: 8,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#dc2626',
+  },
+  logoutText: {
+    color: '#dc2626',
+    fontSize: 16,
     fontWeight: 'bold',
   },
 });

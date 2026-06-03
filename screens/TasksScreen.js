@@ -1,21 +1,47 @@
 import React, { useState, useEffect } from 'react';
 import {
   View, Text, FlatList, StyleSheet,
-  ActivityIndicator, TouchableOpacity
+  ActivityIndicator, TouchableOpacity, TextInput, Alert, Modal
 } from 'react-native';
 import { supabase } from '../supabase';
+import { useAuth } from '../context/AuthContext';
 
 export default function TasksScreen() {
+    const [activeClockAssignmentId, setActiveClockAssignmentId] = useState(null);
+  const { profile } = useAuth();
   const [projects, setProjects] = useState([]);
+  const [assignments, setAssignments] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [selectedProject, setSelectedProject] = useState(null);
   const [loading, setLoading] = useState(false);
 
-  useEffect(() => {
-    fetchProjects();
-  }, []);
+  // Modal state for reporting completed quantity
+  const [modalVisible, setModalVisible] = useState(false);
+  const [selectedAssignment, setSelectedAssignment] = useState(null);
+  const [completedQty, setCompletedQty] = useState('');
 
-  // Fetch all active projects for the filter bar
+  const isWorker = profile?.role === 'worker';
+
+  useEffect(() => {
+  fetchProjects();
+  checkActiveClockEvent();
+}, []);
+// Check if worker has an active clock event and which assignment it's for
+const checkActiveClockEvent = async () => {
+  const { data: { user } } = await supabase.auth.getUser();
+
+  const { data } = await supabase
+    .from('clock_events')
+    .select('task_assignment_id')
+    .eq('user_id', user.id)
+    .is('clock_out', null)
+    .single();
+
+  if (data?.task_assignment_id) {
+    setActiveClockAssignmentId(data.task_assignment_id);
+  }
+};
+  // Fetch projects
   const fetchProjects = async () => {
     const { data, error } = await supabase
       .from('projects')
@@ -29,19 +55,40 @@ export default function TasksScreen() {
     }
   };
 
-  // Fetch tasks for the selected project
+  // Fetch tasks — workers see only their assignments, others see all tasks
   const fetchTasks = async (projectId) => {
     setLoading(true);
 
-    const { data, error } = await supabase
-      .from('tasks')
-      .select('id, name, estimated_hours, material_cost, quantity, building_id')
-      .eq('project_id', projectId);
+    if (isWorker) {
+      // Fetch only this worker's assignments for this project
+      const { data, error } = await supabase
+        .from('task_assignments')
+        .select(`
+          id,
+          status,
+          completed_quantity,
+          tasks (id, name, estimated_hours, quantity)
+        `)
+        .eq('project_id', projectId)
+        .eq('user_id', profile.id);
 
-    if (error) {
-      console.error('Error fetching tasks:', error.message);
+      if (error) {
+        console.error('Error fetching assignments:', error.message);
+      } else {
+        setAssignments(data);
+      }
     } else {
-      setTasks(data);
+      // Managers and leaders see all tasks
+      const { data, error } = await supabase
+        .from('tasks')
+        .select('id, name, estimated_hours, quantity, building_id')
+        .eq('project_id', projectId);
+
+      if (error) {
+        console.error('Error fetching tasks:', error.message);
+      } else {
+        setTasks(data);
+      }
     }
 
     setLoading(false);
@@ -50,20 +97,82 @@ export default function TasksScreen() {
   // Called when a project filter is selected
   const handleSelectProject = (project) => {
     setSelectedProject(project);
+    setAssignments([]);
+    setTasks([]);
     fetchTasks(project.id);
   };
 
-  // Renders a single task card
+  // Opens the report modal for a specific assignment
+  const handleOpenReport = (assignment) => {
+    setSelectedAssignment(assignment);
+    setCompletedQty(assignment.completed_quantity?.toString() || '');
+    setModalVisible(true);
+  };
+
+  // Saves the reported completed quantity to the database
+  const handleSubmitReport = async () => {
+    if (!completedQty || isNaN(completedQty)) {
+      Alert.alert('Error', 'Please enter a valid number.');
+      return;
+    }
+
+    const { error } = await supabase
+      .from('task_assignments')
+      .update({
+        completed_quantity: parseFloat(completedQty),
+        status: 'in_progress',
+      })
+      .eq('id', selectedAssignment.id);
+
+    if (error) {
+      Alert.alert('Error', error.message);
+    } else {
+      Alert.alert('Success', 'Progress reported successfully.');
+      setModalVisible(false);
+      fetchTasks(selectedProject.id);
+    }
+  };
+
+  // Renders a worker's assigned task card
+  const renderAssignment = ({ item }) => {
+  // Check if this assignment has an active clock event
+  const isActive = activeClockAssignmentId === item.id;
+
+  return (
+    <View style={styles.card}>
+      <Text style={styles.taskName}>{item.tasks?.name}</Text>
+      <View style={styles.detailRow}>
+        <Text style={styles.detailLabel}>Target Quantity:</Text>
+        <Text style={styles.detailValue}>{item.tasks?.quantity}</Text>
+      </View>
+      <View style={styles.detailRow}>
+        <Text style={styles.detailLabel}>Completed:</Text>
+        <Text style={styles.detailValue}>{item.completed_quantity ?? 0}</Text>
+      </View>
+      <View style={styles.detailRow}>
+        <Text style={styles.detailLabel}>Status:</Text>
+        <Text style={[styles.detailValue, styles.status]}>{item.status}</Text>
+      </View>
+      <TouchableOpacity
+        style={[styles.reportButton, !isActive && styles.reportButtonDisabled]}
+        onPress={() => isActive && handleOpenReport(item)}
+        disabled={!isActive}
+      >
+        <Text style={styles.reportButtonText}>
+          {isActive ? 'Report Progress' : 'Clock in to this task first'}
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
+};
+
+  // Renders a manager's task card
   const renderTask = ({ item }) => (
     <View style={styles.card}>
       <Text style={styles.taskName}>{item.name}</Text>
       <View style={styles.detailRow}>
         <Text style={styles.detailLabel}>Estimated Hours:</Text>
         <Text style={styles.detailValue}>{item.estimated_hours}h</Text>
-      </View>
-      <View style={styles.detailRow}>
-        <Text style={styles.detailLabel}>Material Cost:</Text>
-        <Text style={styles.detailValue}>₪{item.material_cost}</Text>
       </View>
       <View style={styles.detailRow}>
         <Text style={styles.detailLabel}>Quantity:</Text>
@@ -74,7 +183,7 @@ export default function TasksScreen() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Tasks</Text>
+      <Text style={styles.title}>{isWorker ? 'My Tasks' : 'Tasks'}</Text>
 
       {/* Project filter bar */}
       <FlatList
@@ -101,22 +210,64 @@ export default function TasksScreen() {
         </View>
       )}
 
-      {/* Task list */}
-      {!loading && selectedProject && (
+      {/* Worker assignments list */}
+      {!loading && isWorker && (
+        <FlatList
+          data={assignments}
+          keyExtractor={(item) => item.id}
+          renderItem={renderAssignment}
+          ListEmptyComponent={
+            selectedProject
+              ? <Text style={styles.empty}>No tasks assigned to you for this project.</Text>
+              : <Text style={styles.empty}>Select a project to view your tasks.</Text>
+          }
+        />
+      )}
+
+      {/* Manager task list */}
+      {!loading && !isWorker && (
         <FlatList
           data={tasks}
           keyExtractor={(item) => item.id}
           renderItem={renderTask}
-          ListEmptyComponent={<Text style={styles.empty}>No tasks found for this project.</Text>}
+          ListEmptyComponent={
+            selectedProject
+              ? <Text style={styles.empty}>No tasks found for this project.</Text>
+              : <Text style={styles.empty}>Select a project to view tasks.</Text>
+          }
         />
       )}
 
-      {/* Prompt to select a project */}
-      {!selectedProject && (
-        <View style={styles.centered}>
-          <Text style={styles.prompt}>Select a project to view its tasks.</Text>
+      {/* Report Progress Modal */}
+      <Modal
+        visible={modalVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setModalVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Report Progress</Text>
+            <Text style={styles.modalSubtitle}>{selectedAssignment?.tasks?.name}</Text>
+            <Text style={styles.modalLabel}>
+              Target: {selectedAssignment?.tasks?.quantity} units
+            </Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Completed quantity"
+              value={completedQty}
+              onChangeText={setCompletedQty}
+              keyboardType="numeric"
+            />
+            <TouchableOpacity style={styles.submitButton} onPress={handleSubmitReport}>
+              <Text style={styles.submitButtonText}>Submit</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.cancelButton} onPress={() => setModalVisible(false)}>
+              <Text style={styles.cancelButtonText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
         </View>
-      )}
+      </Modal>
     </View>
   );
 }
@@ -186,19 +337,88 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#111827',
   },
+  status: {
+    textTransform: 'uppercase',
+    color: '#2563eb',
+  },
+  reportButton: {
+    backgroundColor: '#2563eb',
+    padding: 10,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginTop: 12,
+  },
+  reportButtonDisabled: {
+  backgroundColor: '#9ca3af',
+},
+  reportButtonText: {
+    color: '#fff',
+    fontWeight: 'bold',
+  },
   centered: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-  },
-  prompt: {
-    fontSize: 16,
-    color: '#6b7280',
   },
   empty: {
     fontSize: 16,
     color: '#6b7280',
     textAlign: 'center',
     marginTop: 32,
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  modalCard: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    padding: 24,
+  },
+  modalTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    marginBottom: 4,
+  },
+  modalSubtitle: {
+    fontSize: 16,
+    color: '#6b7280',
+    marginBottom: 8,
+  },
+  modalLabel: {
+    fontSize: 14,
+    color: '#374151',
+    marginBottom: 16,
+  },
+  input: {
+    backgroundColor: '#f5f5f5',
+    padding: 14,
+    borderRadius: 8,
+    fontSize: 16,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    marginBottom: 12,
+  },
+  submitButton: {
+    backgroundColor: '#16a34a',
+    padding: 14,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  submitButtonText: {
+    color: '#fff',
+    fontWeight: 'bold',
+    fontSize: 16,
+  },
+  cancelButton: {
+    padding: 14,
+    alignItems: 'center',
+  },
+  cancelButtonText: {
+    color: '#6b7280',
+    fontSize: 16,
   },
 });
